@@ -90,70 +90,8 @@ var (
 	}
 )
 
-type kcpConn struct {
-	conn   net.Conn
-	stream *smux.Stream
-}
-
-func (c *kcpConn) Read(b []byte) (n int, err error) {
-	return c.stream.Read(b)
-}
-
-func (c *kcpConn) Write(b []byte) (n int, err error) {
-	return c.stream.Write(b)
-}
-
-func (c *kcpConn) Close() error {
-	return c.stream.Close()
-}
-
-func (c *kcpConn) LocalAddr() net.Addr {
-	return c.conn.LocalAddr()
-}
-
-func (c *kcpConn) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
-}
-
-func (c *kcpConn) SetDeadline(t time.Time) error {
-	return c.conn.SetDeadline(t)
-}
-
-func (c *kcpConn) SetReadDeadline(t time.Time) error {
-	return c.conn.SetReadDeadline(t)
-}
-
-func (c *kcpConn) SetWriteDeadline(t time.Time) error {
-	return c.conn.SetWriteDeadline(t)
-}
-
-type kcpSession struct {
-	conn    net.Conn
-	session *smux.Session
-}
-
-func (session *kcpSession) GetConn() (*kcpConn, error) {
-	stream, err := session.session.OpenStream()
-	if err != nil {
-		return nil, err
-	}
-	return &kcpConn{conn: session.conn, stream: stream}, nil
-}
-
-func (session *kcpSession) Close() error {
-	return session.session.Close()
-}
-
-func (session *kcpSession) IsClosed() bool {
-	return session.session.IsClosed()
-}
-
-func (session *kcpSession) NumStreams() int {
-	return session.session.NumStreams()
-}
-
 type kcpTransporter struct {
-	sessions     map[string]*kcpSession
+	sessions     map[string]*muxSession
 	sessionMutex sync.Mutex
 	config       *KCPConfig
 }
@@ -172,7 +110,7 @@ func KCPTransporter(config *KCPConfig) Transporter {
 
 	return &kcpTransporter{
 		config:   config,
-		sessions: make(map[string]*kcpSession),
+		sessions: make(map[string]*muxSession),
 	}
 }
 
@@ -191,7 +129,7 @@ func (tr *kcpTransporter) Dial(addr string, options ...DialOption) (conn net.Con
 		if err != nil {
 			return
 		}
-		session = &kcpSession{conn: conn}
+		session = &muxSession{conn: conn}
 		tr.sessions[addr] = session
 	}
 	return session.conn, nil
@@ -210,10 +148,6 @@ func (tr *kcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 	defer tr.sessionMutex.Unlock()
 
 	session, ok := tr.sessions[opts.Addr]
-	if session != nil && session.conn != conn {
-		conn.Close()
-		return nil, errors.New("kcp: unrecognized connection")
-	}
 	if !ok || session.session == nil {
 		s, err := tr.initSession(opts.Addr, conn, config)
 		if err != nil {
@@ -234,7 +168,7 @@ func (tr *kcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 	return cc, nil
 }
 
-func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPConfig) (*kcpSession, error) {
+func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPConfig) (*muxSession, error) {
 	udpConn, ok := conn.(*net.UDPConn)
 	if !ok {
 		return nil, errors.New("kcp: wrong connection type")
@@ -276,7 +210,7 @@ func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPCon
 	if err != nil {
 		return nil, err
 	}
-	return &kcpSession{conn: conn, session: session}, nil
+	return &muxSession{conn: conn, session: session}, nil
 }
 
 func (tr *kcpTransporter) Multiplex() bool {
@@ -374,7 +308,7 @@ func (l *kcpListener) mux(conn net.Conn) {
 			return
 		}
 
-		cc := &kcpConn{conn: conn, stream: stream}
+		cc := &muxStreamConn{Conn: conn, stream: stream}
 		select {
 		case l.connChan <- cc:
 		default:

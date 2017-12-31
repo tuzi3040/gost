@@ -87,16 +87,22 @@
 			"revisionTime": "2017-09-04T03:46:09Z"
 		},
 		{
-			"checksumSHA1": "4JEexBJToQeQm7fAo2PHVdCU3zM=",
+			"checksumSHA1": "Onmjh8hT6pjAixkuGJN4KKAaTT4=",
 			"path": "github.com/ginuerzh/gosocks5",
-			"revision": "cb895c2f7a2cdceaf74ac6497f709b71a999168a",
-			"revisionTime": "2017-08-01T04:47:37Z"
+			"revision": "9e981f6c6b480d7e35e856a334c652a1ebe17fd1",
+			"revisionTime": "2017-09-11T08:28:29Z"
 		},
 		{
 			"checksumSHA1": "9e9tjPDTESeCEdUMElph250lurs=",
 			"path": "github.com/ginuerzh/pht",
 			"revision": "8acf34a91f436364fadb82a630ab3c7e938e1d0f",
 			"revisionTime": "2017-02-05T06:52:49Z"
+		},
+		{
+			"checksumSHA1": "ZefD404me5Nm13S6NTsfJ57UApI=",
+			"path": "github.com/ginuerzh/tls-dissector",
+			"revision": "ede94e83b36efefb6d06e5a29d28e2211b8bd6a9",
+			"revisionTime": "2017-10-29T12:10:54Z"
 		},
 		{
 			"checksumSHA1": "fBx0fqiyrl26gkGo14J9pJ8zB2Y=",

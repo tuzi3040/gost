@@ -14,7 +14,7 @@ import (
 )
 
 // Version is the gost version.
-const Version = "2.4"
+const Version = "2.5-dev"
 
 // Debug is a flag that enables the debug log.
 var Debug bool
@@ -38,7 +38,7 @@ var (
 	// PingTimeout is the timeout for pinging.
 	PingTimeout = 30 * time.Second
 	// PingRetries is the reties of ping.
-	PingRetries = 3
+	PingRetries = 1
 	// default udp node TTL in second for udp port forwarding.
 	defaultTTL = 60 * time.Second
 )
@@ -51,25 +51,18 @@ var (
 	DefaultUserAgent = "Chrome/60.0.3112.90"
 )
 
-func init() {
-	rawCert, rawKey, err := generateKeyPair()
-	if err != nil {
-		panic(err)
-	}
-	cert, err := tls.X509KeyPair(rawCert, rawKey)
-	if err != nil {
-		panic(err)
-	}
-	DefaultTLSConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}
-
-	// log.DefaultLogger = &LogLogger{}
-}
-
 // SetLogger sets a new logger for internal log system
 func SetLogger(logger log.Logger) {
 	log.DefaultLogger = logger
+}
+
+// GenCertificate generates a random TLS certificate
+func GenCertificate() (cert tls.Certificate, err error) {
+	rawCert, rawKey, err := generateKeyPair()
+	if err != nil {
+		return
+	}
+	return tls.X509KeyPair(rawCert, rawKey)
 }
 
 func generateKeyPair() (rawCert, rawKey []byte, err error) {

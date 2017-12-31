@@ -12,6 +12,18 @@ import (
 	"github.com/go-log/log"
 )
 
+type forwardConnector struct {
+}
+
+// ForwardConnector creates a Connector for data forward client.
+func ForwardConnector() Connector {
+	return &forwardConnector{}
+}
+
+func (c *forwardConnector) Connect(conn net.Conn, addr string) (net.Conn, error) {
+	return conn, nil
+}
+
 type tcpDirectForwardHandler struct {
 	raddr   string
 	options *HandlerOptions
@@ -20,6 +32,9 @@ type tcpDirectForwardHandler struct {
 // TCPDirectForwardHandler creates a server Handler for TCP port forwarding server.
 // The raddr is the remote address that the server will forward to.
 func TCPDirectForwardHandler(raddr string, opts ...HandlerOption) Handler {
+	if raddr == "" {
+		raddr = "0.0.0.0:0"
+	}
 	h := &tcpDirectForwardHandler{
 		raddr:   raddr,
 		options: &HandlerOptions{},

@@ -22,10 +22,8 @@ import (
 )
 
 var (
-	options struct {
-		ChainNodes, ServeNodes stringList
-		Debug                  bool
-	}
+	options route
+	routes  []route
 )
 
 func init() {
@@ -43,186 +41,276 @@ func init() {
 	flag.BoolVar(&printVersion, "V", false, "print version")
 	flag.Parse()
 
-	if err := loadConfigureFile(configureFile); err != nil {
-		log.Log(err)
-		os.Exit(1)
-	}
-
-	if flag.NFlag() == 0 {
-		flag.PrintDefaults()
-		os.Exit(0)
-	}
-
 	if printVersion {
 		fmt.Fprintf(os.Stderr, "gost %s (%s)\n", gost.Version, runtime.Version())
 		os.Exit(0)
 	}
 
+	if len(options.ServeNodes) > 0 {
+		routes = append(routes, options)
+	}
 	gost.Debug = options.Debug
+
+	if err := loadConfigureFile(configureFile); err != nil {
+		log.Log(err)
+		os.Exit(1)
+	}
+
+	if flag.NFlag() == 0 || len(routes) == 0 {
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
+
 }
 
 func main() {
-	chain, err := initChain()
+	// generate random self-signed certificate.
+	cert, err := gost.GenCertificate()
 	if err != nil {
 		log.Log(err)
 		os.Exit(1)
 	}
-	if err := serve(chain); err != nil {
-		log.Log(err)
-		os.Exit(1)
+	gost.DefaultTLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
 	}
+
+	for _, route := range routes {
+		if err := route.serve(); err != nil {
+			log.Log(err)
+			os.Exit(1)
+		}
+	}
+
 	select {}
 }
 
-func initChain() (*gost.Chain, error) {
+type route struct {
+	ChainNodes, ServeNodes stringList
+	Retries                int
+	Debug                  bool
+}
+
+func (r *route) initChain() (*gost.Chain, error) {
 	chain := gost.NewChain()
-	for _, ns := range options.ChainNodes {
-		node, err := gost.ParseNode(ns)
+	chain.Retries = r.Retries
+
+	gid := 1 // group ID
+
+	for _, ns := range r.ChainNodes {
+		ngroup := gost.NewNodeGroup()
+		ngroup.ID = gid
+		gid++
+
+		// parse the base node
+		nodes, err := parseChainNode(ns)
 		if err != nil {
 			return nil, err
-		}
-		users, err := parseUsers(node.Values.Get("secrets"))
-		if err != nil {
-			return nil, err
-		}
-		if node.User == nil && len(users) > 0 {
-			node.User = users[0]
-		}
-		serverName, _, _ := net.SplitHostPort(node.Addr)
-		if serverName == "" {
-			serverName = "localhost" // default server name
 		}
 
-		rootCAs, err := loadCA(node.Values.Get("ca"))
+		nid := 1 // node ID
+
+		for i := range nodes {
+			nodes[i].ID = nid
+			nid++
+		}
+		ngroup.AddNode(nodes...)
+
+		// parse peer nodes if exists
+		peerCfg, err := loadPeerConfig(nodes[0].Values.Get("peer"))
 		if err != nil {
-			return nil, err
+			log.Log(err)
 		}
-		tlsCfg := &tls.Config{
-			ServerName:         serverName,
-			InsecureSkipVerify: !toBool(node.Values.Get("secure")),
-			RootCAs:            rootCAs,
-		}
-		var tr gost.Transporter
-		switch node.Transport {
-		case "tls":
-			tr = gost.TLSTransporter()
-		case "ws":
-			wsOpts := &gost.WSOptions{}
-			wsOpts.EnableCompression = toBool(node.Values.Get("compression"))
-			wsOpts.ReadBufferSize, _ = strconv.Atoi(node.Values.Get("rbuf"))
-			wsOpts.WriteBufferSize, _ = strconv.Atoi(node.Values.Get("wbuf"))
-			wsOpts.UserAgent = node.Values.Get("agent")
-			tr = gost.WSTransporter(wsOpts)
-		case "wss":
-			wsOpts := &gost.WSOptions{}
-			wsOpts.EnableCompression = toBool(node.Values.Get("compression"))
-			wsOpts.ReadBufferSize, _ = strconv.Atoi(node.Values.Get("rbuf"))
-			wsOpts.WriteBufferSize, _ = strconv.Atoi(node.Values.Get("wbuf"))
-			tr = gost.WSSTransporter(wsOpts)
-		case "kcp":
-			if !chain.IsEmpty() {
-				return nil, errors.New("KCP must be the first node in the proxy chain")
-			}
-			config, err := parseKCPConfig(node.Values.Get("c"))
+		peerCfg.Validate()
+		ngroup.Options = append(ngroup.Options,
+			gost.WithFilter(&gost.FailFilter{
+				MaxFails:    peerCfg.MaxFails,
+				FailTimeout: time.Duration(peerCfg.FailTimeout) * time.Second,
+			}),
+			gost.WithStrategy(parseStrategy(peerCfg.Strategy)),
+		)
+
+		for _, s := range peerCfg.Nodes {
+			nodes, err = parseChainNode(s)
 			if err != nil {
 				return nil, err
 			}
-			tr = gost.KCPTransporter(config)
-		case "ssh":
-			if node.Protocol == "direct" || node.Protocol == "remote" || node.Protocol == "forward" {
-				tr = gost.SSHForwardTransporter()
-			} else {
-				tr = gost.SSHTunnelTransporter()
+
+			for i := range nodes {
+				nodes[i].ID = nid
+				nid++
 			}
 
-			node.DialOptions = append(node.DialOptions,
-				gost.ChainDialOption(chain),
-			)
-			chain = gost.NewChain() // cutoff the chain for multiplex
-		case "quic":
-			if !chain.IsEmpty() {
-				return nil, errors.New("QUIC must be the first node in the proxy chain")
-			}
-			config := &gost.QUICConfig{
-				TLSConfig: tlsCfg,
-				KeepAlive: toBool(node.Values.Get("keepalive")),
-			}
-			tr = gost.QUICTransporter(config)
-		case "http2":
-			tr = gost.HTTP2Transporter(tlsCfg)
-			node.DialOptions = append(node.DialOptions,
-				gost.ChainDialOption(chain),
-			)
-			chain = gost.NewChain() // cutoff the chain for multiplex
-		case "h2":
-			tr = gost.H2Transporter(tlsCfg)
-			node.DialOptions = append(node.DialOptions,
-				gost.ChainDialOption(chain),
-			)
-			chain = gost.NewChain() // cutoff the chain for multiplex
-		case "h2c":
-			tr = gost.H2CTransporter()
-			node.DialOptions = append(node.DialOptions,
-				gost.ChainDialOption(chain),
-			)
-			chain = gost.NewChain() // cutoff the chain for multiplex
-		case "obfs4":
-			if err := gost.Obfs4Init(node, false); err != nil {
-				return nil, err
-			}
-			tr = gost.Obfs4Transporter()
-		default:
-			tr = gost.TCPTransporter()
+			ngroup.AddNode(nodes...)
 		}
 
-		var connector gost.Connector
-		switch node.Protocol {
-		case "http2":
-			connector = gost.HTTP2Connector(node.User)
-		case "socks", "socks5":
-			connector = gost.SOCKS5Connector(node.User)
-		case "socks4":
-			connector = gost.SOCKS4Connector()
-		case "socks4a":
-			connector = gost.SOCKS4AConnector()
-		case "ss":
-			connector = gost.ShadowConnector(node.User)
-		case "direct", "forward":
-			connector = gost.SSHDirectForwardConnector()
-		case "remote":
-			connector = gost.SSHRemoteForwardConnector()
-		case "http":
-			fallthrough
-		default:
-			node.Protocol = "http" // default protocol is HTTP
-			connector = gost.HTTPConnector(node.User)
-		}
-
-		timeout, _ := strconv.Atoi(node.Values.Get("timeout"))
-		node.DialOptions = append(node.DialOptions,
-			gost.TimeoutDialOption(time.Duration(timeout)*time.Second),
-			gost.IPDialOption(parseIP(node.Values.Get("ip"))...),
-		)
-
-		interval, _ := strconv.Atoi(node.Values.Get("ping"))
-		node.HandshakeOptions = append(node.HandshakeOptions,
-			gost.AddrHandshakeOption(node.Addr),
-			gost.UserHandshakeOption(node.User),
-			gost.TLSConfigHandshakeOption(tlsCfg),
-			gost.IntervalHandshakeOption(time.Duration(interval)*time.Second),
-		)
-		node.Client = &gost.Client{
-			Connector:   connector,
-			Transporter: tr,
-		}
-		chain.AddNode(node)
+		chain.AddNodeGroup(ngroup)
 	}
 
 	return chain, nil
 }
 
-func serve(chain *gost.Chain) error {
-	for _, ns := range options.ServeNodes {
+func parseChainNode(ns string) (nodes []gost.Node, err error) {
+	node, err := gost.ParseNode(ns)
+	if err != nil {
+		return
+	}
+
+	users, err := parseUsers(node.Values.Get("secrets"))
+	if err != nil {
+		return
+	}
+	if node.User == nil && len(users) > 0 {
+		node.User = users[0]
+	}
+	serverName, sport, _ := net.SplitHostPort(node.Addr)
+	if serverName == "" {
+		serverName = "localhost" // default server name
+	}
+
+	rootCAs, err := loadCA(node.Values.Get("ca"))
+	if err != nil {
+		return
+	}
+	tlsCfg := &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: !toBool(node.Values.Get("secure")),
+		RootCAs:            rootCAs,
+	}
+	wsOpts := &gost.WSOptions{}
+	wsOpts.EnableCompression = toBool(node.Values.Get("compression"))
+	wsOpts.ReadBufferSize, _ = strconv.Atoi(node.Values.Get("rbuf"))
+	wsOpts.WriteBufferSize, _ = strconv.Atoi(node.Values.Get("wbuf"))
+	wsOpts.UserAgent = node.Values.Get("agent")
+
+	var tr gost.Transporter
+	switch node.Transport {
+	case "tls":
+		tr = gost.TLSTransporter()
+	case "mtls":
+		tr = gost.MTLSTransporter()
+	case "ws":
+		tr = gost.WSTransporter(wsOpts)
+	case "mws":
+		tr = gost.MWSTransporter(wsOpts)
+	case "wss":
+		tr = gost.WSSTransporter(wsOpts)
+	case "mwss":
+		tr = gost.MWSSTransporter(wsOpts)
+	case "kcp":
+		/*
+			if !chain.IsEmpty() {
+				return nil, errors.New("KCP must be the first node in the proxy chain")
+			}
+		*/
+		config, err := parseKCPConfig(node.Values.Get("c"))
+		if err != nil {
+			return nil, err
+		}
+		tr = gost.KCPTransporter(config)
+	case "ssh":
+		if node.Protocol == "direct" || node.Protocol == "remote" {
+			tr = gost.SSHForwardTransporter()
+		} else {
+			tr = gost.SSHTunnelTransporter()
+		}
+	case "quic":
+		/*
+			if !chain.IsEmpty() {
+				return nil, errors.New("QUIC must be the first node in the proxy chain")
+			}
+		*/
+		config := &gost.QUICConfig{
+			TLSConfig: tlsCfg,
+			KeepAlive: toBool(node.Values.Get("keepalive")),
+		}
+		tr = gost.QUICTransporter(config)
+	case "http2":
+		tr = gost.HTTP2Transporter(tlsCfg)
+	case "h2":
+		tr = gost.H2Transporter(tlsCfg)
+	case "h2c":
+		tr = gost.H2CTransporter()
+
+	case "obfs4":
+		if err := gost.Obfs4Init(node, false); err != nil {
+			return nil, err
+		}
+		tr = gost.Obfs4Transporter()
+	case "ohttp":
+		tr = gost.ObfsHTTPTransporter()
+	default:
+		tr = gost.TCPTransporter()
+	}
+
+	var connector gost.Connector
+	switch node.Protocol {
+	case "http2":
+		connector = gost.HTTP2Connector(node.User)
+	case "socks", "socks5":
+		connector = gost.SOCKS5Connector(node.User)
+	case "socks4":
+		connector = gost.SOCKS4Connector()
+	case "socks4a":
+		connector = gost.SOCKS4AConnector()
+	case "ss":
+		connector = gost.ShadowConnector(node.User)
+	case "direct":
+		connector = gost.SSHDirectForwardConnector()
+	case "remote":
+		connector = gost.SSHRemoteForwardConnector()
+	case "forward":
+		connector = gost.ForwardConnector()
+	case "sni":
+		connector = gost.SNIConnector(node.Values.Get("host"))
+	case "http":
+		fallthrough
+	default:
+		node.Protocol = "http" // default protocol is HTTP
+		connector = gost.HTTPConnector(node.User)
+	}
+
+	timeout, _ := strconv.Atoi(node.Values.Get("timeout"))
+	node.DialOptions = append(node.DialOptions,
+		gost.TimeoutDialOption(time.Duration(timeout)*time.Second),
+	)
+
+	interval, _ := strconv.Atoi(node.Values.Get("ping"))
+	retry, _ := strconv.Atoi(node.Values.Get("retry"))
+	handshakeOptions := []gost.HandshakeOption{
+		gost.AddrHandshakeOption(node.Addr),
+		gost.HostHandshakeOption(node.Host),
+		gost.UserHandshakeOption(node.User),
+		gost.TLSConfigHandshakeOption(tlsCfg),
+		gost.IntervalHandshakeOption(time.Duration(interval) * time.Second),
+		gost.TimeoutHandshakeOption(time.Duration(timeout) * time.Second),
+		gost.RetryHandshakeOption(retry),
+	}
+	node.Client = &gost.Client{
+		Connector:   connector,
+		Transporter: tr,
+	}
+
+	ips := parseIP(node.Values.Get("ip"), sport)
+	for _, ip := range ips {
+		node.Addr = ip
+		node.HandshakeOptions = append(handshakeOptions, gost.AddrHandshakeOption(ip))
+		nodes = append(nodes, node)
+	}
+	if len(ips) == 0 {
+		node.HandshakeOptions = handshakeOptions
+		nodes = []gost.Node{node}
+	}
+
+	return
+}
+
+func (r *route) serve() error {
+	chain, err := r.initChain()
+	if err != nil {
+		return err
+	}
+
+	for _, ns := range r.ServeNodes {
 		node, err := gost.ParseNode(ns)
 		if err != nil {
 			return err
@@ -239,22 +327,27 @@ func serve(chain *gost.Chain) error {
 		if err != nil && certFile != "" && keyFile != "" {
 			return err
 		}
+
+		wsOpts := &gost.WSOptions{}
+		wsOpts.EnableCompression = toBool(node.Values.Get("compression"))
+		wsOpts.ReadBufferSize, _ = strconv.Atoi(node.Values.Get("rbuf"))
+		wsOpts.WriteBufferSize, _ = strconv.Atoi(node.Values.Get("wbuf"))
+
 		var ln gost.Listener
 		switch node.Transport {
 		case "tls":
 			ln, err = gost.TLSListener(node.Addr, tlsCfg)
+		case "mtls":
+			ln, err = gost.MTLSListener(node.Addr, tlsCfg)
 		case "ws":
-			wsOpts := &gost.WSOptions{}
-			wsOpts.EnableCompression = toBool(node.Values.Get("compression"))
-			wsOpts.ReadBufferSize, _ = strconv.Atoi(node.Values.Get("rbuf"))
 			wsOpts.WriteBufferSize, _ = strconv.Atoi(node.Values.Get("wbuf"))
 			ln, err = gost.WSListener(node.Addr, wsOpts)
+		case "mws":
+			ln, err = gost.MWSListener(node.Addr, wsOpts)
 		case "wss":
-			wsOpts := &gost.WSOptions{}
-			wsOpts.EnableCompression = toBool(node.Values.Get("compression"))
-			wsOpts.ReadBufferSize, _ = strconv.Atoi(node.Values.Get("rbuf"))
-			wsOpts.WriteBufferSize, _ = strconv.Atoi(node.Values.Get("wbuf"))
 			ln, err = gost.WSSListener(node.Addr, tlsCfg, wsOpts)
+		case "mwss":
+			ln, err = gost.MWSSListener(node.Addr, tlsCfg, wsOpts)
 		case "kcp":
 			config, er := parseKCPConfig(node.Values.Get("c"))
 			if er != nil {
@@ -285,16 +378,18 @@ func serve(chain *gost.Chain) error {
 			ln, err = gost.H2Listener(node.Addr, tlsCfg)
 		case "h2c":
 			ln, err = gost.H2CListener(node.Addr)
-		case "obfs4":
-			if err = gost.Obfs4Init(node, true); err != nil {
-				return err
-			}
-			ln, err = gost.Obfs4Listener(node.Addr)
 		case "tcp":
+			// Directly use SSH port forwarding if the last chain node is forward+ssh
+			if chain.LastNode().Protocol == "forward" && chain.LastNode().Transport == "ssh" {
+				chain.Nodes()[len(chain.Nodes())-1].Client.Connector = gost.SSHDirectForwardConnector()
+				chain.Nodes()[len(chain.Nodes())-1].Client.Transporter = gost.SSHForwardTransporter()
+			}
 			ln, err = gost.TCPListener(node.Addr)
 		case "rtcp":
+			// Directly use SSH port forwarding if the last chain node is forward+ssh
 			if chain.LastNode().Protocol == "forward" && chain.LastNode().Transport == "ssh" {
 				chain.Nodes()[len(chain.Nodes())-1].Client.Connector = gost.SSHRemoteForwardConnector()
+				chain.Nodes()[len(chain.Nodes())-1].Client.Transporter = gost.SSHForwardTransporter()
 			}
 			ln, err = gost.TCPRemoteForwardListener(node.Addr, chain)
 		case "udp":
@@ -306,6 +401,13 @@ func serve(chain *gost.Chain) error {
 		case "ssu":
 			ttl, _ := strconv.Atoi(node.Values.Get("ttl"))
 			ln, err = gost.ShadowUDPListener(node.Addr, node.User, time.Duration(ttl)*time.Second)
+		case "obfs4":
+			if err = gost.Obfs4Init(node, true); err != nil {
+				return err
+			}
+			ln, err = gost.Obfs4Listener(node.Addr)
+		case "ohttp":
+			ln, err = gost.ObfsHTTPListener(node.Addr)
 		default:
 			ln, err = gost.TCPListener(node.Addr)
 		}
@@ -361,9 +463,17 @@ func serve(chain *gost.Chain) error {
 			handler = gost.TCPRedirectHandler(handlerOptions...)
 		case "ssu":
 			handler = gost.ShadowUDPdHandler(handlerOptions...)
+		case "sni":
+			handler = gost.SNIHandler(handlerOptions...)
 		default:
-			handler = gost.AutoHandler(handlerOptions...)
+			// start from 2.5, if remote is not empty, then we assume that it is a forward tunnel
+			if node.Remote != "" {
+				handler = gost.TCPDirectForwardHandler(node.Remote, handlerOptions...)
+			} else {
+				handler = gost.AutoHandler(handlerOptions...)
+			}
 		}
+
 		srv := &gost.Server{Listener: ln}
 		go srv.Serve(handler)
 	}
@@ -409,9 +519,24 @@ func loadConfigureFile(configureFile string) error {
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(content, &options); err != nil {
+	var cfg struct {
+		route
+		Routes []route
+	}
+	if err := json.Unmarshal(content, &cfg); err != nil {
 		return err
 	}
+
+	if len(cfg.route.ServeNodes) > 0 {
+		routes = append(routes, cfg.route)
+	}
+	for _, route := range cfg.Routes {
+		if len(cfg.route.ServeNodes) > 0 {
+			routes = append(routes, route)
+		}
+	}
+	gost.Debug = cfg.Debug
+
 	return nil
 }
 
@@ -478,17 +603,26 @@ func parseUsers(authFile string) (users []*url.Userinfo, err error) {
 	return
 }
 
-func parseIP(s string) (ips []string) {
+func parseIP(s string, port string) (ips []string) {
 	if s == "" {
-		return nil
+		return
 	}
+	if port == "" {
+		port = "8080" // default port
+	}
+
 	file, err := os.Open(s)
 	if err != nil {
 		ss := strings.Split(s, ",")
 		for _, s := range ss {
-			if ip := net.ParseIP(s); ip != nil {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				if !strings.Contains(s, ":") {
+					s = s + ":" + port
+				}
 				ips = append(ips, s)
 			}
+
 		}
 		return
 	}
@@ -499,9 +633,51 @@ func parseIP(s string) (ips []string) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if ip := net.ParseIP(line); ip != nil {
-			ips = append(ips, line)
+		if !strings.Contains(line, ":") {
+			line = line + ":" + port
 		}
+		ips = append(ips, line)
 	}
 	return
+}
+
+type peerConfig struct {
+	Strategy    string   `json:"strategy"`
+	Filters     []string `json:"filters"`
+	MaxFails    int      `json:"max_fails"`
+	FailTimeout int      `json:"fail_timeout"`
+	Nodes       []string `json:"nodes"`
+}
+
+func loadPeerConfig(peer string) (config peerConfig, err error) {
+	if peer == "" {
+		return
+	}
+	content, err := ioutil.ReadFile(peer)
+	if err != nil {
+		return
+	}
+	err = json.Unmarshal(content, &config)
+	return
+}
+
+func (cfg *peerConfig) Validate() {
+	if cfg.MaxFails <= 0 {
+		cfg.MaxFails = 1
+	}
+	if cfg.FailTimeout <= 0 {
+		cfg.FailTimeout = 30 // seconds
+	}
+}
+
+func parseStrategy(s string) gost.Strategy {
+	switch s {
+	case "random":
+		return &gost.RandomStrategy{}
+	case "round":
+		fallthrough
+	default:
+		return &gost.RoundStrategy{}
+
+	}
 }

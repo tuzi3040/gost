@@ -93,6 +93,13 @@ func (h *httpHandler) Handle(conn net.Conn) {
 		return
 	}
 
+	h.handleRequest(conn, req)
+}
+
+func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
+	if req == nil {
+		return
+	}
 	if Debug {
 		dump, _ := httputil.DumpRequest(req, false)
 		log.Logf("[http] %s -> %s\n%s", conn.RemoteAddr(), req.Host, string(dump))
@@ -135,6 +142,13 @@ func (h *httpHandler) Handle(conn net.Conn) {
 	req.Header.Del("Proxy-Authorization")
 	// req.Header.Del("Proxy-Connection")
 
+	// try to get the actual host.
+	if v := req.Header.Get("Gost-Target"); v != "" {
+		if host, err := decodeServerName(v); err == nil {
+			req.Host = host
+		}
+	}
+
 	// forward http request
 	lastNode := h.options.Chain.LastNode()
 	if req.Method != http.MethodConnect && lastNode.Protocol == "http" {
@@ -143,17 +157,18 @@ func (h *httpHandler) Handle(conn net.Conn) {
 	}
 
 	host := req.Host
-	if !strings.Contains(req.Host, ":") {
+	if !strings.Contains(host, ":") {
 		host += ":80"
 	}
+
 	cc, err := h.options.Chain.Dial(host)
 	if err != nil {
-		log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), req.Host, err)
+		log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), host, err)
 
 		b := []byte("HTTP/1.1 503 Service unavailable\r\n" +
 			"Proxy-Agent: gost/" + Version + "\r\n\r\n")
 		if Debug {
-			log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), req.Host, string(b))
+			log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), host, string(b))
 		}
 		conn.Write(b)
 		return
@@ -164,21 +179,21 @@ func (h *httpHandler) Handle(conn net.Conn) {
 		b := []byte("HTTP/1.1 200 Connection established\r\n" +
 			"Proxy-Agent: gost/" + Version + "\r\n\r\n")
 		if Debug {
-			log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), req.Host, string(b))
+			log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), host, string(b))
 		}
 		conn.Write(b)
 	} else {
 		req.Header.Del("Proxy-Connection")
 
 		if err = req.Write(cc); err != nil {
-			log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), req.Host, err)
+			log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), host, err)
 			return
 		}
 	}
 
-	log.Logf("[http] %s <-> %s", cc.LocalAddr(), req.Host)
+	log.Logf("[http] %s <-> %s", cc.LocalAddr(), host)
 	transport(conn, cc)
-	log.Logf("[http] %s >-< %s", cc.LocalAddr(), req.Host)
+	log.Logf("[http] %s >-< %s", cc.LocalAddr(), host)
 }
 
 func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request) {
@@ -211,6 +226,9 @@ func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request) {
 	}
 
 	cc.SetWriteDeadline(time.Now().Add(WriteTimeout))
+	if !req.URL.IsAbs() {
+		req.URL.Scheme = "http" // make sure that the URL is absolute
+	}
 	if err = req.WriteProxy(cc); err != nil {
 		log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), req.Host, err)
 		return
