@@ -5,12 +5,13 @@ import "github.com/lucas-clemente/quic-go/internal/protocol"
 type flowController interface {
 	// for sending
 	SendWindowSize() protocol.ByteCount
-	IsBlocked() bool
 	UpdateSendWindow(protocol.ByteCount)
 	AddBytesSent(protocol.ByteCount)
 	// for receiving
 	AddBytesRead(protocol.ByteCount)
 	GetWindowUpdate() protocol.ByteCount // returns 0 if no update is necessary
+	MaybeQueueWindowUpdate()             //  queues a window update, if necessary
+	IsNewlyBlocked() (bool, protocol.ByteCount)
 }
 
 // A StreamFlowController is a flow controller for a QUIC stream.
@@ -31,7 +32,7 @@ type connectionFlowControllerI interface {
 	ConnectionFlowController
 	// The following two methods are not supposed to be called from outside this packet, but are needed internally
 	// for sending
-	EnsureMinimumWindowIncrement(protocol.ByteCount)
+	EnsureMinimumWindowSize(protocol.ByteCount)
 	// for receiving
 	IncrementHighestReceived(protocol.ByteCount) error
 }

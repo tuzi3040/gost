@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"net"
@@ -28,73 +29,135 @@ func SNIConnector(host string) Connector {
 	return &sniConnector{host: host}
 }
 
-func (c *sniConnector) Connect(conn net.Conn, addr string) (net.Conn, error) {
+func (c *sniConnector) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
 	return &sniClientConn{addr: addr, host: c.host, Conn: conn}, nil
 }
 
 type sniHandler struct {
-	options []HandlerOption
+	options *HandlerOptions
 }
 
 // SNIHandler creates a server Handler for SNI proxy server.
 func SNIHandler(opts ...HandlerOption) Handler {
-	h := &sniHandler{
-		options: opts,
-	}
+	h := &sniHandler{}
+	h.Init(opts...)
+
 	return h
 }
 
-func (h *sniHandler) Handle(conn net.Conn) {
-	br := bufio.NewReader(conn)
+func (h *sniHandler) Init(options ...HandlerOption) {
+	if h.options == nil {
+		h.options = &HandlerOptions{}
+	}
 
+	for _, opt := range options {
+		opt(h.options)
+	}
+}
+
+func (h *sniHandler) Handle(conn net.Conn) {
+	defer conn.Close()
+
+	br := bufio.NewReader(conn)
 	hdr, err := br.Peek(dissector.RecordHeaderLen)
 	if err != nil {
-		log.Log("[sni]", err)
-		conn.Close()
+		log.Logf("[sni] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
 		return
 	}
 	conn = &bufferdConn{br: br, Conn: conn}
-	defer conn.Close()
 
 	if hdr[0] != dissector.Handshake {
 		// We assume it is an HTTP request
 		req, err := http.ReadRequest(bufio.NewReader(conn))
 		if err != nil {
-			log.Logf("[sni] %s - %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
+			log.Logf("[sni] %s -> %s : %s",
+				conn.RemoteAddr(), conn.LocalAddr(), err)
 			return
 		}
 		if !req.URL.IsAbs() {
 			req.URL.Scheme = "http" // make sure that the URL is absolute
 		}
-		HTTPHandler(h.options...).(*httpHandler).handleRequest(conn, req)
+		handler := &httpHandler{options: h.options}
+		handler.Init()
+		handler.handleRequest(conn, req)
 		return
 	}
 
 	b, host, err := readClientHelloRecord(conn, "", false)
 	if err != nil {
-		log.Log("[sni]", err)
+		log.Logf("[sni] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
 		return
 	}
 
-	options := &HandlerOptions{}
-	for _, opt := range h.options {
-		opt(options)
+	_, sport, _ := net.SplitHostPort(h.options.Host)
+	if sport == "" {
+		sport = "443"
 	}
+	host = net.JoinHostPort(host, sport)
 
-	if !Can("tcp", host, options.Whitelist, options.Blacklist) {
-		log.Logf("[sni] Unauthorized to tcp connect to %s", host)
+	log.Logf("[sni] %s -> %s -> %s",
+		conn.RemoteAddr(), h.options.Node.String(), host)
+
+	if !Can("tcp", host, h.options.Whitelist, h.options.Blacklist) {
+		log.Logf("[sni] %s -> %s : Unauthorized to tcp connect to %s",
+			conn.RemoteAddr(), conn.LocalAddr(), host)
+		return
+	}
+	if h.options.Bypass.Contains(host) {
+		log.Log("[sni] %s - %s bypass %s",
+			conn.RemoteAddr(), conn.LocalAddr(), host)
 		return
 	}
 
-	cc, err := options.Chain.Dial(host + ":443")
+	retries := 1
+	if h.options.Chain != nil && h.options.Chain.Retries > 0 {
+		retries = h.options.Chain.Retries
+	}
+	if h.options.Retries > 0 {
+		retries = h.options.Retries
+	}
+
+	var cc net.Conn
+	var route *Chain
+	for i := 0; i < retries; i++ {
+		route, err = h.options.Chain.selectRouteFor(host)
+		if err != nil {
+			log.Logf("[sni] %s -> %s : %s",
+				conn.RemoteAddr(), conn.LocalAddr(), err)
+			continue
+		}
+
+		buf := bytes.Buffer{}
+		fmt.Fprintf(&buf, "%s -> %s -> ",
+			conn.RemoteAddr(), h.options.Node.String())
+		for _, nd := range route.route {
+			fmt.Fprintf(&buf, "%d@%s -> ", nd.ID, nd.String())
+		}
+		fmt.Fprintf(&buf, "%s", host)
+		log.Log("[route]", buf.String())
+
+		cc, err = route.Dial(host,
+			TimeoutChainOption(h.options.Timeout),
+			HostsChainOption(h.options.Hosts),
+			ResolverChainOption(h.options.Resolver),
+		)
+		if err == nil {
+			break
+		}
+		log.Logf("[sni] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
+	}
+
 	if err != nil {
-		log.Logf("[sni] %s -> %s : %s", conn.RemoteAddr(), host, err)
 		return
 	}
 	defer cc.Close()
 
 	if _, err := cc.Write(b); err != nil {
-		log.Logf("[sni] %s -> %s : %s", conn.RemoteAddr(), host, err)
+		log.Logf("[sni] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
 	}
 
 	log.Logf("[sni] %s <-> %s", cc.LocalAddr(), host)

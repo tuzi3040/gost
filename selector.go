@@ -22,9 +22,7 @@ type defaultSelector struct {
 }
 
 func (s *defaultSelector) Select(nodes []Node, opts ...SelectOption) (Node, error) {
-	sopts := SelectOptions{
-		Strategy: &RoundStrategy{},
-	}
+	sopts := SelectOptions{}
 	for _, opt := range opts {
 		opt(&sopts)
 	}
@@ -35,7 +33,11 @@ func (s *defaultSelector) Select(nodes []Node, opts ...SelectOption) (Node, erro
 	if len(nodes) == 0 {
 		return Node{}, ErrNoneAvailable
 	}
-	return sopts.Strategy.Apply(nodes), nil
+	strategy := sopts.Strategy
+	if strategy == nil {
+		strategy = &RoundStrategy{}
+	}
+	return strategy.Apply(nodes), nil
 }
 
 // SelectOption is the option used when making a select call.
@@ -68,10 +70,24 @@ type Strategy interface {
 	String() string
 }
 
+// NewStrategy creates a Strategy by the name s.
+func NewStrategy(s string) Strategy {
+	switch s {
+	case "random":
+		return &RandomStrategy{}
+	case "fifo":
+		return &FIFOStrategy{}
+	case "round":
+		fallthrough
+	default:
+		return &RoundStrategy{}
+	}
+}
+
 // RoundStrategy is a strategy for node selector.
 // The node will be selected by round-robin algorithm.
 type RoundStrategy struct {
-	count uint64
+	counter uint64
 }
 
 // Apply applies the round-robin strategy for the nodes.
@@ -79,9 +95,9 @@ func (s *RoundStrategy) Apply(nodes []Node) Node {
 	if len(nodes) == 0 {
 		return Node{}
 	}
-	old := atomic.LoadUint64(&s.count)
-	atomic.AddUint64(&s.count, 1)
-	return nodes[int(old%uint64(len(nodes)))]
+
+	n := atomic.AddUint64(&s.counter, 1) - 1
+	return nodes[int(n%uint64(len(nodes)))]
 }
 
 func (s *RoundStrategy) String() string {
@@ -94,6 +110,7 @@ type RandomStrategy struct {
 	Seed int64
 	rand *rand.Rand
 	once sync.Once
+	mux  sync.Mutex
 }
 
 // Apply applies the random strategy for the nodes.
@@ -109,7 +126,11 @@ func (s *RandomStrategy) Apply(nodes []Node) Node {
 		return Node{}
 	}
 
-	return nodes[s.rand.Int()%len(nodes)]
+	s.mux.Lock()
+	r := s.rand.Int()
+	s.mux.Unlock()
+
+	return nodes[r%len(nodes)]
 }
 
 func (s *RandomStrategy) String() string {
@@ -153,9 +174,14 @@ func (f *FailFilter) Filter(nodes []Node) []Node {
 	}
 	nl := []Node{}
 	for i := range nodes {
-		if atomic.LoadUint32(&nodes[i].failCount) < uint32(f.MaxFails) ||
-			time.Since(time.Unix(atomic.LoadInt64(&nodes[i].failTime), 0)) >= f.FailTimeout {
-			nl = append(nl, nodes[i].Clone())
+		marker := &failMarker{}
+		if nil != nodes[i].marker {
+			marker = nodes[i].marker.Clone()
+		}
+		// log.Logf("%s: %d/%d %v/%v", nodes[i], marker.failCount, f.MaxFails, marker.failTime, f.FailTimeout)
+		if marker.failCount < uint32(f.MaxFails) ||
+			time.Since(time.Unix(marker.failTime, 0)) >= f.FailTimeout {
+			nl = append(nl, nodes[i])
 		}
 	}
 	return nl
@@ -163,4 +189,38 @@ func (f *FailFilter) Filter(nodes []Node) []Node {
 
 func (f *FailFilter) String() string {
 	return "fail"
+}
+
+type failMarker struct {
+	failTime  int64
+	failCount uint32
+	mux       sync.RWMutex
+}
+
+func (m *failMarker) Mark() {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	m.failTime = time.Now().Unix()
+	m.failCount++
+}
+
+func (m *failMarker) Reset() {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	m.failTime = 0
+	m.failCount = 0
+}
+
+func (m *failMarker) Clone() *failMarker {
+	m.mux.RLock()
+	defer m.mux.RUnlock()
+
+	fc, ft := m.failCount, m.failTime
+
+	return &failMarker{
+		failCount: fc,
+		failTime:  ft,
+	}
 }

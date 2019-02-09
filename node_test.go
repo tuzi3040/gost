@@ -8,7 +8,7 @@ var nodeTests = []struct {
 	out      Node
 	hasError bool
 }{
-	{"", Node{}, false},
+	{"", Node{}, true},
 	{"://", Node{}, true},
 	{"localhost", Node{Addr: "localhost", Transport: "tcp"}, false},
 	{":", Node{Addr: ":", Transport: "tcp"}, false},
@@ -35,7 +35,7 @@ func TestParseNode(t *testing.T) {
 		actual, err := ParseNode(test.in)
 		if err != nil {
 			if test.hasError {
-				t.Logf("ParseNode(%q) got expected error: %v", test.in, err)
+				// t.Logf("ParseNode(%q) got expected error: %v", test.in, err)
 				continue
 			}
 			t.Errorf("ParseNode(%q) got error: %v", test.in, err)

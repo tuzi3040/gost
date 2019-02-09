@@ -8,9 +8,26 @@ import (
 	"github.com/go-log/log"
 )
 
+// Accepter represents a network endpoint that can accept connection from peer.
+type Accepter interface {
+	Accept() (net.Conn, error)
+}
+
 // Server is a proxy server.
 type Server struct {
 	Listener Listener
+	Handler  Handler
+	options  *ServerOptions
+}
+
+// Init intializes server with given options.
+func (s *Server) Init(opts ...ServerOption) {
+	if s.options == nil {
+		s.options = &ServerOptions{}
+	}
+	for _, opt := range opts {
+		opt(s.options)
+	}
 }
 
 // Addr returns the address of the server
@@ -24,13 +41,19 @@ func (s *Server) Close() error {
 }
 
 // Serve serves as a proxy server.
-func (s *Server) Serve(h Handler) error {
+func (s *Server) Serve(h Handler, opts ...ServerOption) error {
+	s.Init(opts...)
+
 	if s.Listener == nil {
 		ln, err := TCPListener("")
 		if err != nil {
 			return err
 		}
 		s.Listener = ln
+	}
+
+	if h == nil {
+		h = s.Handler
 	}
 	if h == nil {
 		h = HTTPHandler()
@@ -57,10 +80,30 @@ func (s *Server) Serve(h Handler) error {
 			return e
 		}
 		tempDelay = 0
+
+		/*
+			if s.options.Bypass.Contains(conn.RemoteAddr().String()) {
+				log.Log("[bypass]", conn.RemoteAddr())
+				conn.Close()
+				continue
+			}
+		*/
+
 		go h.Handle(conn)
 	}
-
 }
+
+// Run starts to serve.
+func (s *Server) Run() error {
+	return s.Serve(s.Handler)
+}
+
+// ServerOptions holds the options for Server.
+type ServerOptions struct {
+}
+
+// ServerOption allows a common way to set server options.
+type ServerOption func(opts *ServerOptions)
 
 // Listener is a proxy server listener, just like a net.Listener.
 type Listener interface {
@@ -101,12 +144,18 @@ func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
 func transport(rw1, rw2 io.ReadWriter) error {
 	errc := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(rw1, rw2)
+		buf := lPool.Get().([]byte)
+		defer lPool.Put(buf)
+
+		_, err := io.CopyBuffer(rw1, rw2, buf)
 		errc <- err
 	}()
 
 	go func() {
-		_, err := io.Copy(rw2, rw1)
+		buf := lPool.Get().([]byte)
+		defer lPool.Put(buf)
+
+		_, err := io.CopyBuffer(rw2, rw1, buf)
 		errc <- err
 	}()
 
